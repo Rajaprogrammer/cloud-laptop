@@ -2,7 +2,7 @@ name: OCI A1 capacity hunter
 
 on:
   schedule:
-    # Every 30 minutes. Adjust if you want, but don't spam too hard.
+    # Every 5 minutes, but offset to minute 2 (2,7,12,17,...) to avoid the :00/:05 crowd
     - cron: '*/5 * * * *'
   # Allow manual run from the "Actions" tab
   workflow_dispatch: {}
@@ -23,7 +23,7 @@ jobs:
       OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
       OCI_AD_INDEX: ${{ secrets.OCI_AD_INDEX }}
 
-      # These should also be set as secrets, or defaults below will be used
+      # Optional; defaults applied in steps if not set
       OCI_INSTANCE_NAME: ${{ secrets.OCI_INSTANCE_NAME }}
       OCI_A1_OCPUS: ${{ secrets.OCI_A1_OCPUS }}
       OCI_A1_MEMORY_GB: ${{ secrets.OCI_A1_MEMORY_GB }}
@@ -54,15 +54,32 @@ jobs:
           key_file=$HOME/.oci/oci_api_key.pem
           EOF
 
-      - name: Install OCI CLI (and jq is preinstalled)
+          chmod 600 "$HOME/.oci/config"
+          export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+
+      - name: Restore OCI CLI from cache
+        uses: actions/cache@v4
+        with:
+          path: ~/oci-cli
+          key: ${{ runner.os }}-oci-cli-v1
+
+      - name: Install OCI CLI (if needed)
         shell: bash
         run: |
           set -euo pipefail
-          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
-            | bash -s -- --accept-all-defaults
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$HOME/oci-cli/bin/oci" ]; then
+            echo "OCI CLI not found in cache, installing..."
+            mkdir -p "$HOME/oci-cli"
+            curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
+              | bash -s -- --accept-all-defaults --install-dir "$HOME/oci-cli" --exec-dir "$HOME/oci-cli/bin"
+          else
+            echo "OCI CLI already present in cache."
+          fi
+
+          echo "$HOME/oci-cli/bin" >> "$GITHUB_PATH"
 
       - name: Try to create A1 instance if it does not exist
+        id: main
         shell: bash
         run: |
           set -euo pipefail
@@ -79,11 +96,16 @@ jobs:
             --display-name "$OCI_INSTANCE_NAME" \
             --all)
 
-          # If any instance with that name exists (even terminated), treat it as "exists" for safety
-          existing_id=$(echo "$existing_json" | jq -r '.data[0].id // empty')
+          # Any non-terminated instance with that name counts as "exists"
+          existing_id=$(echo "$existing_json" | jq -r '.data[]
+            | select(."lifecycle-state" != "TERMINATED")
+            | .id' | head -n 1 || true)
 
           if [ -n "$existing_id" ]; then
-            echo "Instance already exists (OCID: $existing_id). Nothing to do."
+            summary="Instance '$OCI_INSTANCE_NAME' already exists (OCID: $existing_id); no action."
+            echo "$summary"
+            echo "result=already-exists" >> "$GITHUB_OUTPUT"
+            echo "summary=$summary" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -91,10 +113,13 @@ jobs:
 
           # Determine AD name from index
           ad_list=$(oci iam availability-domain list --compartment-id "$OCI_TENANCY_OCID")
-          AD_NAME=$(echo "$ad_list" | jq -r ".data[$OCI_AD_INDEX].name")
+          AD_NAME=$(echo "$ad_list" | jq -r ".data[$OCI_AD_INDEX].name" || echo "")
           if [ -z "$AD_NAME" ] || [ "$AD_NAME" = "null" ]; then
-            echo "Failed to determine AD name for index $OCI_AD_INDEX"
-            exit 1
+            summary="Config error: failed to determine AD name for index $OCI_AD_INDEX."
+            echo "$summary"
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            echo "summary=$summary" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "Using AD: $AD_NAME"
 
@@ -120,7 +145,7 @@ jobs:
           }
           EOF
 
-          # SSH key for the A1 instance
+          # SSH key for the A1 instance (generated on the runner)
           SSH_KEY_BASE="$HOME/.ssh/oci_a1"
           SSH_PUB="$SSH_KEY_BASE.pub"
           mkdir -p "$HOME/.ssh"
@@ -152,23 +177,44 @@ jobs:
 
           if [ $rc -ne 0 ]; then
             if echo "$launch_output" | grep -q "Out of host capacity"; then
-              echo "Out of host capacity. Will try again on next scheduled run."
+              summary="Out of host capacity for A1 in region $OCI_REGION; will retry on next run."
+              echo "$summary"
+              echo "result=out-of-capacity" >> "$GITHUB_OUTPUT"
+              echo "summary=$summary" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             if echo "$launch_output" | grep -q "LimitExceeded"; then
-              echo "Service limit exceeded. Fix limits in OCI; stopping."
+              summary="Service limit exceeded for A1 in region $OCI_REGION; adjust limits or delete other A1 instances."
+              echo "$summary"
+              echo "result=limit-exceeded" >> "$GITHUB_OUTPUT"
+              echo "summary=$summary" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "Unexpected error (rc=$rc). Failing workflow."
-            exit 1
+            summary="Unexpected error launching A1 (rc=$rc). Check Actions logs."
+            echo "$summary"
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            echo "summary=$summary" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          # Parse instance OCID with jq
-          instance_id=$(echo "$launch_output" | jq -r '.data.id')
+          instance_id=$(echo "$launch_output" | jq -r '.data.id' || echo "")
           if [ -z "$instance_id" ] || [ "$instance_id" = "null" ]; then
-            echo "Launch succeeded but could not parse instance ID."
-            exit 1
+            summary="Launch succeeded but could not parse instance ID."
+            echo "$summary"
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            echo "summary=$summary" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          echo "Launch accepted. Instance OCID: $instance_id"
-          echo "On the next run, the workflow will detect this instance and will not create another."
+          summary="Successfully launched '$OCI_INSTANCE_NAME' A1 instance (OCID: $instance_id, $OCI_A1_OCPUS OCPUs, $OCI_A1_MEMORY_GB GB RAM, $OCI_A1_BOOT_GB GB boot)."
+          echo "$summary"
+          echo "result=success" >> "$GITHUB_OUTPUT"
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release with run result
+        if: steps.main.outputs.result != 'already-exists'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "a1-run-${{ github.run_id }}-${{ steps.main.outputs.result }}"
+          name: "OCI A1 run #${{ github.run_number }} - ${{ steps.main.outputs.result }}"
+          body: ${{ steps.main.outputs.summary }}
