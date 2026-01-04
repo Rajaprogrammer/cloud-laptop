@@ -1,10 +1,12 @@
 name: OCI A1 capacity hunter
 
 on:
-  schedule:
-    # Every 5 minutes
-    - cron: '*/5 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      started_at:
+        description: 'Unix timestamp when this retry chain started (internal, do not touch)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -36,12 +38,13 @@ jobs:
 
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
 
+      GH_PAT: ${{ secrets.GH_PAT }}
+
     steps:
       - name: Set up OCI config and key
         shell: bash
         run: |
           set -euo pipefail
-
           : "${OCI_INSTANCE_NAME:=cloud-laptop}"
           : "${OCI_A1_OCPUS:=4}"
           : "${OCI_A1_MEMORY_GB:=24}"
@@ -59,7 +62,6 @@ jobs:
           region=$OCI_REGION
           key_file=$HOME/.oci/oci_api_key.pem
           EOF
-
           chmod 600 "$HOME/.oci/config"
 
       - name: Install OCI CLI via pip
@@ -69,11 +71,22 @@ jobs:
           python3 -m pip install --user --upgrade oci-cli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Try to create A1 instance if it does not exist
+      - name: Single A1 capacity check + launch attempt
         id: main
         shell: bash
         run: |
           set -euo pipefail
+
+          # Chain start tracking (for 4h window)
+          STARTED_AT_INPUT="${{ github.event.inputs.started_at }}"
+          if [ -z "$STARTED_AT_INPUT" ]; then
+            CHAIN_STARTED_AT=$(date -u +%s)
+            echo "No chain start passed; starting new chain at $CHAIN_STARTED_AT"
+          else
+            CHAIN_STARTED_AT="$STARTED_AT_INPUT"
+            echo "Continuing existing chain started at $CHAIN_STARTED_AT"
+          fi
+          echo "chain_started_at=$CHAIN_STARTED_AT" >> "$GITHUB_OUTPUT"
 
           : "${OCI_INSTANCE_NAME:=cloud-laptop}"
           : "${OCI_A1_OCPUS:=4}"
@@ -89,13 +102,13 @@ jobs:
             exit 0
           fi
 
-          # Write only the first line of SSH_PUBLIC_KEY, strip possible Windows \r
+          # Prepare SSH public key
           mkdir -p "$HOME/.ssh"
           SSH_PUB="$HOME/.ssh/oci_cloud_laptop.pub"
           printf '%s\n' "$SSH_PUBLIC_KEY" | head -n 1 | sed 's/\r$//' > "$SSH_PUB"
           chmod 600 "$SSH_PUB"
 
-          # Validate format with ssh-keygen -l (must be valid OpenSSH public key)
+          # Validate key
           if ! ssh-keygen -l -f "$SSH_PUB" >/dev/null 2>&1; then
             summary="SSH_PUBLIC_KEY is not a valid OpenSSH public key (ssh-keygen -l failed)."
             echo "$summary"
@@ -107,8 +120,6 @@ jobs:
 
           echo "Using SSH public key:"
           ssh-keygen -l -f "$SSH_PUB"
-
-          # Expose the public key as an output so the release can include it
           echo "ssh_public_key=$(cat "$SSH_PUB")" >> "$GITHUB_OUTPUT"
 
           echo "Checking if instance '$OCI_INSTANCE_NAME' already exists..."
@@ -144,20 +155,17 @@ jobs:
 
           TEMPL_DIR="$HOME/oci-templates"
           mkdir -p "$TEMPL_DIR"
-
           cat > "$TEMPL_DIR/instanceOptions.json" <<EOF
           {
             "areLegacyImdsEndpointsDisabled": false
           }
           EOF
-
           cat > "$TEMPL_DIR/shapeConfig.json" <<EOF
           {
             "ocpus": $OCI_A1_OCPUS,
             "memoryInGBs": $OCI_A1_MEMORY_GB
           }
           EOF
-
           cat > "$TEMPL_DIR/availabilityConfig.json" <<EOF
           {
             "recoveryAction": "RESTORE_INSTANCE"
@@ -165,7 +173,6 @@ jobs:
           EOF
 
           echo "Attempting to launch instance..."
-
           set +e
           launch_output=$(oci compute instance launch \
             --availability-domain "$AD_NAME" \
@@ -182,25 +189,24 @@ jobs:
             --ssh-authorized-keys-file "$SSH_PUB" 2>&1)
           rc=$?
           set -e
-
           echo "$launch_output"
 
           if [ $rc -ne 0 ]; then
             if echo "$launch_output" | grep -q "Out of host capacity"; then
-              summary="Out of host capacity for A1 in region $OCI_REGION; will retry on next run."
+              summary="Out of host capacity for A1 in region $OCI_REGION; will try again on next run."
               echo "$summary"
               echo "result=out-of-capacity" >> "$GITHUB_OUTPUT"
               echo "summary=$summary" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             if echo "$launch_output" | grep -q "LimitExceeded"; then
-              summary="Service limit exceeded for A1 in region $OCI_REGION; adjust limits or delete other A1 instances."
+              summary="Service limit exceeded for A1 in region $OCI_REGION; stopping retries."
               echo "$summary"
               echo "result=limit-exceeded" >> "$GITHUB_OUTPUT"
               echo "summary=$summary" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            summary="Unexpected error launching A1 (rc=$rc). Check Actions logs."
+            summary="Unexpected error launching A1 (rc=$rc). Stopping retries."
             echo "$summary"
             echo "result=error" >> "$GITHUB_OUTPUT"
             echo "summary=$summary" >> "$GITHUB_OUTPUT"
@@ -229,7 +235,52 @@ jobs:
           name: "OCI A1 run #${{ github.run_number }} - ${{ steps.main.outputs.result }}"
           body: |
             ${{ steps.main.outputs.summary }}
-
             SSH public key used for this run:
-
             ${{ steps.main.outputs.ssh_public_key }}
+
+      - name: Queue next check if still out of capacity (with 4h chains)
+        if: steps.main.outputs.result == 'out-of-capacity'
+        shell: bash
+        run: |
+          OWNER="rajaprogrammer"
+          REPO="cloud-laptop"
+          WORKFLOW_FILE="oci-a1-hunter.yml"
+          BRANCH="main"
+
+          CHAIN_STARTED_AT="${{ steps.main.outputs.chain_started_at }}"
+          NOW=$(date -u +%s)
+          ELAPSED=$((NOW - CHAIN_STARTED_AT))
+          LIMIT=$((4*60*60))   # 4 hours in seconds
+
+          echo "Current chain started at: $CHAIN_STARTED_AT"
+          echo "Elapsed seconds in this chain: $ELAPSED"
+
+          if [ "$ELAPSED" -ge "$LIMIT" ]; then
+            echo "Chain reached 4 hours; starting a FRESH chain."
+            NEW_STARTED_AT="$NOW"
+          else
+            echo "Chain under 4 hours; continuing same chain."
+            NEW_STARTED_AT="$CHAIN_STARTED_AT"
+          fi
+
+          # Optional: enforce a minimum delay between checks:
+          # sleep 60
+
+          JSON_PAYLOAD=$(cat <<EOF
+          {
+            "ref": "$BRANCH",
+            "inputs": {
+              "started_at": "$NEW_STARTED_AT"
+            }
+          }
+          EOF
+          )
+
+          echo "Re-dispatching workflow $WORKFLOW_FILE on $OWNER/$REPO@$BRANCH"
+          echo "Payload: $JSON_PAYLOAD"
+
+          curl -s -X POST \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
+            -d "$JSON_PAYLOAD"
