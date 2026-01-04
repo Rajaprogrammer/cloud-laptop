@@ -4,8 +4,10 @@ on:
   schedule:
     # Every 5 minutes
     - cron: '*/5 * * * *'
-  # Allow manual run from the "Actions" tab
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   create-a1:
@@ -32,7 +34,6 @@ jobs:
       # Public key you generated on your PC
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
 
-      # Silence OCI CLI file permission warnings
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
 
     steps:
@@ -41,7 +42,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Defaults if some optional envs are empty
           : "${OCI_INSTANCE_NAME:=cloud-laptop}"
           : "${OCI_A1_OCPUS:=4}"
           : "${OCI_A1_MEMORY_GB:=24}"
@@ -75,7 +75,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Ensure defaults again here
           : "${OCI_INSTANCE_NAME:=cloud-laptop}"
           : "${OCI_A1_OCPUS:=4}"
           : "${OCI_A1_MEMORY_GB:=24}"
@@ -90,11 +89,24 @@ jobs:
             exit 0
           fi
 
-          # Prepare SSH public key file used for this run
+          # Write only the first line of SSH_PUBLIC_KEY, strip possible Windows \r
           mkdir -p "$HOME/.ssh"
           SSH_PUB="$HOME/.ssh/oci_cloud_laptop.pub"
-          printf '%s\n' "$SSH_PUBLIC_KEY" > "$SSH_PUB"
+          printf '%s\n' "$SSH_PUBLIC_KEY" | head -n 1 | sed 's/\r$//' > "$SSH_PUB"
           chmod 600 "$SSH_PUB"
+
+          # Validate format with ssh-keygen -l (must be valid OpenSSH public key)
+          if ! ssh-keygen -l -f "$SSH_PUB" >/dev/null 2>&1; then
+            summary="SSH_PUBLIC_KEY is not a valid OpenSSH public key (ssh-keygen -l failed)."
+            echo "$summary"
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            echo "summary=$summary" >> "$GITHUB_OUTPUT"
+            echo "ssh_public_key=$(cat "$SSH_PUB")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Using SSH public key:"
+          ssh-keygen -l -f "$SSH_PUB"
 
           # Expose the public key as an output so the release can include it
           echo "ssh_public_key=$(cat "$SSH_PUB")" >> "$GITHUB_OUTPUT"
@@ -105,7 +117,6 @@ jobs:
             --display-name "$OCI_INSTANCE_NAME" \
             --all)
 
-          # Any non-TERMINATED instance with that name counts as "exists"
           existing_id=$(echo "$existing_json" | jq -r '.data[]
             | select(."lifecycle-state" != "TERMINATED")
             | .id' | head -n 1 || true)
@@ -120,7 +131,6 @@ jobs:
 
           echo "No existing instance. Will try to launch new A1 instance..."
 
-          # Determine AD name from index
           ad_list=$(oci iam availability-domain list --compartment-id "$OCI_TENANCY_OCID")
           AD_NAME=$(echo "$ad_list" | jq -r ".data[$OCI_AD_INDEX].name" || echo "")
           if [ -z "$AD_NAME" ] || [ "$AD_NAME" = "null" ]; then
@@ -197,7 +207,6 @@ jobs:
             exit 0
           fi
 
-          # Parse instance OCID with jq
           instance_id=$(echo "$launch_output" | jq -r '.data.id' || echo "")
           if [ -z "$instance_id" ] || [ "$instance_id" = "null" ]; then
             summary="Launch succeeded but could not parse instance ID."
