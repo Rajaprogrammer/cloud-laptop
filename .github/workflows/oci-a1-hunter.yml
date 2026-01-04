@@ -3,7 +3,8 @@ name: OCI A1 capacity hunter
 on:
   schedule:
     # Every 30 minutes. Adjust if you want, but don't spam too hard.
-    - cron: '*/30 * * * *'
+    - cron: '*/5 * * * *'
+  # Allow manual run from the "Actions" tab
   workflow_dispatch: {}
 
 jobs:
@@ -19,20 +20,27 @@ jobs:
 
       OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
       OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
-      OCI_SECLIST_OCID: ${{ secrets.OCI_SECLIST_OCID }}
       OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
       OCI_AD_INDEX: ${{ secrets.OCI_AD_INDEX }}
 
-      OCI_INSTANCE_NAME: ${{ secrets.OCI_INSTANCE_NAME || 'cloud-laptop' }}
-      OCI_A1_OCPUS: ${{ secrets.OCI_A1_OCPUS || '4' }}
-      OCI_A1_MEMORY_GB: ${{ secrets.OCI_A1_MEMORY_GB || '24' }}
-      OCI_A1_BOOT_GB: ${{ secrets.OCI_A1_BOOT_GB || '200' }}
+      # These should also be set as secrets, or defaults below will be used
+      OCI_INSTANCE_NAME: ${{ secrets.OCI_INSTANCE_NAME }}
+      OCI_A1_OCPUS: ${{ secrets.OCI_A1_OCPUS }}
+      OCI_A1_MEMORY_GB: ${{ secrets.OCI_A1_MEMORY_GB }}
+      OCI_A1_BOOT_GB: ${{ secrets.OCI_A1_BOOT_GB }}
 
     steps:
       - name: Set up OCI config and key
         shell: bash
         run: |
           set -euo pipefail
+
+          # Defaults if some optional envs are empty
+          : "${OCI_INSTANCE_NAME:=cloud-laptop}"
+          : "${OCI_A1_OCPUS:=4}"
+          : "${OCI_A1_MEMORY_GB:=24}"
+          : "${OCI_A1_BOOT_GB:=200}"
+
           mkdir -p "$HOME/.oci"
           printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
@@ -46,7 +54,7 @@ jobs:
           key_file=$HOME/.oci/oci_api_key.pem
           EOF
 
-      - name: Install OCI CLI
+      - name: Install OCI CLI (and jq is preinstalled)
         shell: bash
         run: |
           set -euo pipefail
@@ -59,26 +67,35 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Fill defaults again to be safe in this step
+          : "${OCI_INSTANCE_NAME:=cloud-laptop}"
+          : "${OCI_A1_OCPUS:=4}"
+          : "${OCI_A1_MEMORY_GB:=24}"
+          : "${OCI_A1_BOOT_GB:=200}"
+
           echo "Checking if instance '$OCI_INSTANCE_NAME' already exists..."
-          existing_id=$(oci compute instance list \
+          existing_json=$(oci compute instance list \
             --compartment-id "$OCI_COMPARTMENT_OCID" \
             --display-name "$OCI_INSTANCE_NAME" \
-            --all \
-            --query 'data[?`"lifecycle-state"` != `TERMINATED`].id | [0]' \
-            --raw-output 2>/dev/null || echo "")
+            --all)
 
-          if [ -n "$existing_id" ] && [ "$existing_id" != "null" ]; then
+          # If any instance with that name exists (even terminated), treat it as "exists" for safety
+          existing_id=$(echo "$existing_json" | jq -r '.data[0].id // empty')
+
+          if [ -n "$existing_id" ]; then
             echo "Instance already exists (OCID: $existing_id). Nothing to do."
             exit 0
           fi
 
           echo "No existing instance. Will try to launch new A1 instance..."
 
-          AD_NAME=$(oci iam availability-domain list \
-            --compartment-id "$OCI_TENANCY_OCID" \
-            --query "data[${OCI_AD_INDEX}].name" \
-            --raw-output)
-
+          # Determine AD name from index
+          ad_list=$(oci iam availability-domain list --compartment-id "$OCI_TENANCY_OCID")
+          AD_NAME=$(echo "$ad_list" | jq -r ".data[$OCI_AD_INDEX].name")
+          if [ -z "$AD_NAME" ] || [ "$AD_NAME" = "null" ]; then
+            echo "Failed to determine AD name for index $OCI_AD_INDEX"
+            exit 1
+          fi
           echo "Using AD: $AD_NAME"
 
           TEMPL_DIR="$HOME/oci-templates"
@@ -103,6 +120,7 @@ jobs:
           }
           EOF
 
+          # SSH key for the A1 instance
           SSH_KEY_BASE="$HOME/.ssh/oci_a1"
           SSH_PUB="$SSH_KEY_BASE.pub"
           mkdir -p "$HOME/.ssh"
@@ -145,78 +163,12 @@ jobs:
             exit 1
           fi
 
-          instance_id=$(echo "$launch_output" | python3 - <<'PY'
-import sys, json
-data = json.load(sys.stdin)
-print(data["data"]["id"])
-PY
-          )
+          # Parse instance OCID with jq
+          instance_id=$(echo "$launch_output" | jq -r '.data.id')
+          if [ -z "$instance_id" ] || [ "$instance_id" = "null" ]; then
+            echo "Launch succeeded but could not parse instance ID."
+            exit 1
+          fi
 
           echo "Launch accepted. Instance OCID: $instance_id"
-
-          echo "Ensuring security list has TCP 22 and 3389 open from 0.0.0.0/0..."
-          sl_json=$(oci network security-list get --security-list-id "$OCI_SECLIST_OCID")
-
-          ingress=$(echo "$sl_json" | python3 - <<'PY'
-import sys, json
-data = json.load(sys.stdin)
-rules = data["data"].get("ingress-security-rules") or []
-print(json.dumps(rules))
-PY
-          )
-
-          egress=$(echo "$sl_json" | python3 - <<'PY'
-import sys, json
-data = json.load(sys.stdin)
-rules = data["data"].get("egress-security-rules") or []
-print(json.dumps(rules))
-PY
-          )
-
-          add_rule_py=$(cat <<'PY'
-import sys, json
-rules = json.loads(sys.stdin.read())
-port = int(sys.argv[1])
-desc = sys.argv[2]
-for r in rules:
-    if (r.get("protocol") == "6" and
-        r.get("source") == "0.0.0.0/0" and
-        r.get("source-type") == "CIDR_BLOCK" and
-        r.get("tcp-options") and
-        r["tcp-options"].get("destination-port-range") and
-        r["tcp-options"]["destination-port-range"].get("min") == port and
-        r["tcp-options"]["destination-port-range"]["max"] == port):
-        print(json.dumps(rules))
-        sys.exit(0)
-rules.append({
-    "is-stateless": False,
-    "protocol": "6",
-    "source": "0.0.0.0/0",
-    "source-type": "CIDR_BLOCK",
-    "tcp-options": {
-        "destination-port-range": {
-            "min": port,
-            "max": port
-        }
-    },
-    "description": desc
-})
-print(json.dumps(rules))
-PY
-          )
-
-          ingress=$(echo "$ingress" | python3 -c "$add_rule_py" 22 "SSH from anywhere (auto-added)")
-          ingress=$(echo "$ingress" | python3 -c "$add_rule_py" 3389 "RDP from anywhere (auto-added)")
-
-          ingress_file=$(mktemp)
-          egress_file=$(mktemp)
-          echo "$ingress" > "$ingress_file"
-          echo "$egress"  > "$egress_file"
-
-          oci network security-list update \
-            --security-list-id "$OCI_SECLIST_OCID" \
-            --ingress-security-rules "file://$ingress_file" \
-            --egress-security-rules "file://$egress_file" >/dev/null
-
-          rm -f "$ingress_file" "$egress_file"
-          echo "Security list updated. On next run, the workflow will see the instance and do nothing."
+          echo "On the next run, the workflow will detect this instance and will not create another."
