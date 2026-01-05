@@ -1,12 +1,7 @@
 name: OCI A1 capacity hunter
 
 on:
-  workflow_dispatch:
-    inputs:
-      started_at:
-        description: 'Unix timestamp when this retry chain started (internal, do not touch)'
-        required: false
-        default: ''
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -33,11 +28,9 @@ jobs:
       OCI_A1_MEMORY_GB: ${{ secrets.OCI_A1_MEMORY_GB }}
       OCI_A1_BOOT_GB: ${{ secrets.OCI_A1_BOOT_GB }}
 
-      # Public key you generated on your PC
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
 
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-
       GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
@@ -71,23 +64,11 @@ jobs:
           python3 -m pip install --user --upgrade oci-cli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Single A1 capacity check + launch attempt
+      - name: Single A1 capacity check + launch attempt (with debug)
         id: main
         shell: bash
         run: |
           set -euo pipefail
-
-          # Chain start tracking (for 4h window)
-          STARTED_AT_INPUT="${{ github.event.inputs.started_at }}"
-          if [ -z "$STARTED_AT_INPUT" ]; then
-            CHAIN_STARTED_AT=$(date -u +%s)
-            echo "No chain start passed; starting new chain at $CHAIN_STARTED_AT"
-          else
-            CHAIN_STARTED_AT="$STARTED_AT_INPUT"
-            echo "Continuing existing chain started at $CHAIN_STARTED_AT"
-          fi
-          echo "chain_started_at=$CHAIN_STARTED_AT" >> "$GITHUB_OUTPUT"
-
           : "${OCI_INSTANCE_NAME:=cloud-laptop}"
           : "${OCI_A1_OCPUS:=4}"
           : "${OCI_A1_MEMORY_GB:=24}"
@@ -102,13 +83,11 @@ jobs:
             exit 0
           fi
 
-          # Prepare SSH public key
           mkdir -p "$HOME/.ssh"
           SSH_PUB="$HOME/.ssh/oci_cloud_laptop.pub"
           printf '%s\n' "$SSH_PUBLIC_KEY" | head -n 1 | sed 's/\r$//' > "$SSH_PUB"
           chmod 600 "$SSH_PUB"
 
-          # Validate key
           if ! ssh-keygen -l -f "$SSH_PUB" >/dev/null 2>&1; then
             summary="SSH_PUBLIC_KEY is not a valid OpenSSH public key (ssh-keygen -l failed)."
             echo "$summary"
@@ -172,9 +151,9 @@ jobs:
           }
           EOF
 
-          echo "Attempting to launch instance..."
+          echo "Attempting to launch instance with --debug..."
           set +e
-          launch_output=$(oci compute instance launch \
+          launch_output=$(oci --debug compute instance launch \
             --availability-domain "$AD_NAME" \
             --compartment-id "$OCI_COMPARTMENT_OCID" \
             --shape VM.Standard.A1.Flex \
@@ -189,33 +168,43 @@ jobs:
             --ssh-authorized-keys-file "$SSH_PUB" 2>&1)
           rc=$?
           set -e
+
+          # Full raw output (including debug) printed to logs
+          echo "===== OCI CLI raw output (with debug) ====="
           echo "$launch_output"
+          echo "===== end of OCI CLI output ====="
 
           if [ $rc -ne 0 ]; then
+            # Handle explicit conditions based on CLI output
+
             if echo "$launch_output" | grep -q "Out of host capacity"; then
-              summary="Out of host capacity for A1 in region $OCI_REGION; will try again on next run."
-              echo "$summary"
-              echo "result=out-of-capacity" >> "$GITHUB_OUTPUT"
-              echo "summary=$summary" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if echo "$launch_output" | grep -q "LimitExceeded"; then
+              summary="Out of host capacity for A1 in region $OCI_REGION; will retry on next run."
+              result="out-of-capacity"
+
+            elif echo "$launch_output" | grep -q '"code": "TooManyRequests"' || \
+                 echo "$launch_output" | grep -qi "Too many requests"; then
+              summary="OCI API rate-limited (TooManyRequests / 429); will retry on next run."
+              result="rate-limited"
+
+            elif echo "$launch_output" | grep -q "LimitExceeded"; then
               summary="Service limit exceeded for A1 in region $OCI_REGION; stopping retries."
-              echo "$summary"
-              echo "result=limit-exceeded" >> "$GITHUB_OUTPUT"
-              echo "summary=$summary" >> "$GITHUB_OUTPUT"
-              exit 0
+              result="limit-exceeded"
+
+            else
+              summary="Unexpected error launching A1 (rc=$rc). Will retry on next run."
+              result="error"
             fi
-            summary="Unexpected error launching A1 (rc=$rc). Stopping retries."
+
             echo "$summary"
-            echo "result=error" >> "$GITHUB_OUTPUT"
+            echo "result=$result" >> "$GITHUB_OUTPUT"
             echo "summary=$summary" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          # Success path
           instance_id=$(echo "$launch_output" | jq -r '.data.id' || echo "")
           if [ -z "$instance_id" ] || [ "$instance_id" = "null" ]; then
-            summary="Launch succeeded but could not parse instance ID."
+            summary="Launch succeeded but could not parse instance ID. Will retry on next run."
             echo "$summary"
             echo "result=error" >> "$GITHUB_OUTPUT"
             echo "summary=$summary" >> "$GITHUB_OUTPUT"
@@ -238,8 +227,11 @@ jobs:
             SSH public key used for this run:
             ${{ steps.main.outputs.ssh_public_key }}
 
-      - name: Queue next check if still out of capacity (with 4h chains)
-        if: steps.main.outputs.result == 'out-of-capacity'
+      - name: Queue next check on transient failure
+        if: |
+          steps.main.outputs.result == 'out-of-capacity' ||
+          steps.main.outputs.result == 'rate-limited' ||
+          steps.main.outputs.result == 'error'
         shell: bash
         run: |
           OWNER="rajaprogrammer"
@@ -247,37 +239,12 @@ jobs:
           WORKFLOW_FILE="oci-a1-hunter.yml"
           BRANCH="main"
 
-          CHAIN_STARTED_AT="${{ steps.main.outputs.chain_started_at }}"
-          NOW=$(date -u +%s)
-          ELAPSED=$((NOW - CHAIN_STARTED_AT))
-          LIMIT=$((4*60*60))   # 4 hours in seconds
-
-          echo "Current chain started at: $CHAIN_STARTED_AT"
-          echo "Elapsed seconds in this chain: $ELAPSED"
-
-          if [ "$ELAPSED" -ge "$LIMIT" ]; then
-            echo "Chain reached 4 hours; starting a FRESH chain."
-            NEW_STARTED_AT="$NOW"
-          else
-            echo "Chain under 4 hours; continuing same chain."
-            NEW_STARTED_AT="$CHAIN_STARTED_AT"
-          fi
-
-          # Optional: enforce a minimum delay between checks:
+          # Optional: add a small delay between retries if you want, e.g.:
           # sleep 60
 
-          JSON_PAYLOAD=$(cat <<EOF
-          {
-            "ref": "$BRANCH",
-            "inputs": {
-              "started_at": "$NEW_STARTED_AT"
-            }
-          }
-          EOF
-          )
+          JSON_PAYLOAD='{"ref":"'"$BRANCH"'"}'
 
-          echo "Re-dispatching workflow $WORKFLOW_FILE on $OWNER/$REPO@$BRANCH"
-          echo "Payload: $JSON_PAYLOAD"
+          echo "Re-dispatching workflow $WORKFLOW_FILE on $OWNER/$REPO@$BRANCH due to result=${{ steps.main.outputs.result }}"
 
           curl -s -X POST \
             -H "Authorization: token $GH_PAT" \
